@@ -24,7 +24,7 @@ class LogPredictionsCallback(Callback):
 
 if __name__ == '__main__':
     DATA_PATH = 'data/plates2/train'
-    BATCH_SIZE = 64 + 32
+    BATCH_SIZE = 32 + 16
     NUM_WORKERS = int(os.cpu_count() / 2)
     PATCH = (1, 256 // 2 ** 4, 256 // 2 ** 4)
     SAVING_DIR = 'saving_ckpt'
@@ -32,13 +32,13 @@ if __name__ == '__main__':
     # Callbacks
     chk_callback = ModelCheckpoint(
         dirpath=SAVING_DIR,
-        filename='pix2pix_{epoch:02d}-{g_loss:.3f}',
+        filename='pix2pix_{epoch:02d}-{lpips:.3f}',
         verbose=True,
         save_top_k=5,
-        monitor='g_loss',
+        monitor='lpips',
         mode='min'
     )
-    early_stop_callback = EarlyStopping(monitor='g_loss', min_delta=0.00, patience=15, verbose=True, mode='min')
+    early_stop_callback = EarlyStopping(monitor='lpips', min_delta=0.00, patience=15, verbose=True, mode='min')
     lr_monitor_callback = LearningRateMonitor(logging_interval='step')
     log_predictions_callback = LogPredictionsCallback()
 
@@ -48,7 +48,8 @@ if __name__ == '__main__':
         accelerator="auto",
         callbacks=[chk_callback, early_stop_callback, lr_monitor_callback, log_predictions_callback, RichProgressBar()],
         devices=1 if torch.cuda.is_available() else None,
-        # precision=16,
+        precision=16,
+        amp_backend='apex',
         max_epochs=300,
         logger=wandb_logger
     )

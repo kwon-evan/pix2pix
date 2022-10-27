@@ -2,7 +2,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import pytorch_lightning as pl
-from torchmetrics.image.fid import FrechetInceptionDistance
+from torch.autograd import Variable
+from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 
 from models.Generator import GeneratorUNet
 from models.Discriminator import Discriminator
@@ -12,6 +13,9 @@ class Pix2Pix(pl.LightningModule):
     def __init__(self,
                  batch_size: int,
                  patch,
+                 size=256,
+                 cuda=True,
+                 half=True,
                  lambda_pixel: int = 100,
                  lr: float = 2e-4,
                  beta1: float = 0.5,
@@ -21,54 +25,80 @@ class Pix2Pix(pl.LightningModule):
         self.save_hyperparameters()
 
         self.patch = patch
+        self.size = size
         self.lambda_pixel = lambda_pixel
         self.lr = lr
         self.beta1 = beta1
         self.beta2 = beta2
 
+        # generator & discriminator
         self.generator = GeneratorUNet()
         self.discriminator = Discriminator()
 
-        self.metric = FrechetInceptionDistance(feature=64)
+        # metric: fid
+        self.lpips = LearnedPerceptualImagePatchSimilarity(net_type='vgg')
+        self.bce = nn.BCEWithLogitsLoss()
+        self.l1 = nn.L1Loss()
+
+        # Inputs & targets memory allocation
+        self.ttype = torch.Tensor
+        if cuda:
+            if half:
+                self.ttype = torch.cuda.HalfTensor
+            else:
+                self.ttype = torch.cuda.FloatTensor
+        else:
+            self.ttype = torch.Tensor
+
+        self.input_A = self.ttype(batch_size, 3, size, size)
+        self.input_B = self.ttype(batch_size, 3, size, size)
+        self.target_real = torch.ones(batch_size, *self.patch, requires_grad=False).type(self.ttype)
+        self.target_fake = torch.zeros(batch_size, *self.patch, requires_grad=False).type(self.ttype)
 
     def forward(self, z):
         return self.generator(z)
 
     def training_step(self, batch, batch_idx, optimizer_idx):
         a, b = batch
-        ba_si = a.size(0)
+        cur_batch_size = a.size(0)
+
+        self.input_A = self.ttype(cur_batch_size, 3, self.size, self.size)
+        self.input_B = self.ttype(cur_batch_size, 3, self.size, self.size)
+        real_a = Variable(self.input_A.copy_(a)).type(self.ttype)
+        real_b = Variable(self.input_B.copy_(b)).type(self.ttype)
+
+        fake_b = self.generator(real_a)
 
         # patch label
-        real_label = torch.ones(ba_si, *self.patch, requires_grad=False)
-        fake_label = torch.zeros(ba_si, *self.patch, requires_grad=False)
-
-        fake_b = self.generator(a)
+        self.target_real = torch.ones(cur_batch_size, *self.patch, requires_grad=False).type(self.ttype)
+        self.target_fake = torch.zeros(cur_batch_size, *self.patch, requires_grad=False).type(self.ttype)
 
         # generator
         if optimizer_idx == 0:
-            out_dis = self.discriminator(fake_b, b).detach().cpu()  # 가짜 이미지 식별
+            out_dis = self.discriminator(fake_b, real_b)  # 가짜 이미지 식별
 
-            gen_loss = F.binary_cross_entropy_with_logits(out_dis, real_label)
-            pixel_loss = F.l1_loss(fake_b, b)
+            # print(out_dis.dtype)
+            # print(self.target_real.dtype)
+
+            gen_loss = self.bce(out_dis, self.target_real)
+            pixel_loss = self.l1(fake_b, real_b)
 
             g_loss = gen_loss + self.lambda_pixel * pixel_loss
 
             # fid calc
-            self.metric.update(b.type(torch.uint8), real=True)
-            self.metric.update(fake_b.type(torch.uint8), real=False)
-            fid = self.metric.compute()
+            lpips = self.lpips(real_b, fake_b)
 
-            self.log("fid", fid, prog_bar=True)
+            self.log("lpips", lpips, prog_bar=True)
             self.log("g_loss", g_loss, prog_bar=True)
             return g_loss.requires_grad_(True)
 
         # discriminator
         if optimizer_idx == 1:
-            out_dis = self.discriminator(b, a).detach().cpu()  # 진짜 이미지 식별
-            real_loss = F.binary_cross_entropy_with_logits(out_dis, real_label)
+            out_dis = self.discriminator(real_b, real_a)  # 진짜 이미지 식별
+            real_loss = self.bce(out_dis, self.target_real)
 
-            out_dis = self.discriminator(fake_b.detach(), a).detach().cpu()  # 가짜 이미지 식별
-            fake_loss = F.binary_cross_entropy_with_logits(out_dis, fake_label)
+            out_dis = self.discriminator(fake_b, real_a)  # 가짜 이미지 식별
+            fake_loss = self.bce(out_dis, self.target_fake)
 
             d_loss = (real_loss + fake_loss) / 2.
             self.log("d_loss", d_loss, prog_bar=True)
@@ -76,7 +106,13 @@ class Pix2Pix(pl.LightningModule):
 
     def validation_step(self, batch, batch_idx):
         a, _ = batch
-        fake_b = self.generator(a)
+        cur_batch_size = a.size(0)
+
+        self.input_A = self.ttype(cur_batch_size, 3, self.size, self.size)
+        self.input_B = self.ttype(cur_batch_size, 3, self.size, self.size)
+        real_a = Variable(self.input_A.copy_(a)).type(self.ttype)
+
+        fake_b = self.generator(real_a)
         return fake_b
 
     def configure_optimizers(self):
